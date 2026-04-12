@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output directories
+output/
+
+# Session/Profile data
+x_session/
+
+# OS/system files
+.DS_Store
+
+# Environment configurations
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Secrets or cookies
+cookies.json
