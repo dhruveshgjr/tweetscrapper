@@ -102,14 +102,19 @@ def extract_retweet_metadata(tweet: dict, full_text: str = "") -> Tuple[str, str
     """
     For retweets, extract:
     - Original author's screen_name
-    - Original tweet_id (may not be available)
+    - Original tweet_id (from legacy.retweeted_status_id_str or nested rest_id)
     - Original full_text (from nested structure or parsed from RT text)
 
     Checks:
-    1. retweeted_status_result nested structure (if available in JSON)
-    2. full_text parsing as fallback ("RT @screen_name: ...")
+    1. legacy.retweeted_status_result nested structure
+    2. legacy.retweeted_status_id_str
+    3. full_text parsing as fallback ("RT @screen_name: ...")
     """
-    retweeted_result = tweet.get("retweeted_status_result", {})
+    legacy = tweet.get("legacy", {}) if isinstance(tweet.get("legacy"), dict) else {}
+
+    retweeted_status_id_str = legacy.get("retweeted_status_id_str", "")
+
+    retweeted_result = legacy.get("retweeted_status_result", {})
     if retweeted_result:
         result = retweeted_result.get("result", {})
         if result:
@@ -119,19 +124,35 @@ def extract_retweet_metadata(tweet: dict, full_text: str = "") -> Tuple[str, str
             user_core = user_result.get("core", {})
             screen_name = user_core.get("screen_name", "")
 
-            legacy = result.get("legacy", {})
-            original_id = str(legacy.get("id_str", ""))
-            original_full_text = normalize_text(legacy.get("full_text", ""))
+            if not screen_name:
+                user_core = user_result.get("legacy", {})
+                screen_name = (
+                    user_core.get("screen_name", "") if isinstance(user_core, dict) else ""
+                )
 
-            return screen_name, original_id, original_full_text
+            nested_id = result.get("rest_id", "")
+
+            rt_legacy = result.get("legacy", {})
+            original_id = str(rt_legacy.get("id_str", "")) if isinstance(rt_legacy, dict) else ""
+            original_full_text = (
+                normalize_text(rt_legacy.get("full_text", ""))
+                if isinstance(rt_legacy, dict)
+                else ""
+            )
+
+            return (
+                screen_name,
+                retweeted_status_id_str or nested_id or original_id,
+                original_full_text,
+            )
 
     if full_text.startswith("RT @"):
         match = re.match(r"RT @(\w+):", full_text)
         if match:
             screen_name = match.group(1)
-            return screen_name, "", ""
+            return screen_name, retweeted_status_id_str, ""
 
-    return "", "", ""
+    return "", retweeted_status_id_str, ""
 
 
 def extract_entities(tweet: dict) -> Tuple[List[str], List[str], List[str]]:
@@ -243,38 +264,48 @@ def extract_entities(tweet: dict) -> Tuple[List[str], List[str], List[str]]:
 def extract_full_text(tweet: dict) -> Tuple[str, bool]:
     """
     Extract full_text from multiple possible paths.
-    For retweets, prefer the original tweet's text.
+    For retweets, get the complete original tweet text from retweeted_status_result
+    and prefix with "RT @{username}:" for clarity.
 
     Returns (full_text, is_retweet).
     """
     legacy = tweet.get("legacy", {}) if isinstance(tweet.get("legacy"), dict) else {}
     full_text = legacy.get("full_text", "")
 
-    retweeted_result = tweet.get("retweeted_status_result", {})
-    has_retweet_structure = bool(retweeted_result)
+    retweeted = tweet.get("retweeted_status_result", {}).get("result", {})
+    if retweeted:
+        rt_legacy = retweeted.get("legacy", {})
+        rt_full_text = rt_legacy.get("full_text", "") if isinstance(rt_legacy, dict) else ""
+        if rt_full_text:
+            rt_user = deep_get(
+                retweeted, ["core", "user_results", "result", "legacy", "screen_name"], ""
+            )
+            if not rt_user:
+                rt_user = deep_get(
+                    retweeted, ["core", "user_results", "result", "core", "screen_name"], ""
+                )
+            if rt_user:
+                full_text = f"RT @{rt_user}: {rt_full_text}"
+            else:
+                full_text = rt_full_text
+        is_retweet = True
+    elif full_text and len(full_text) > 10:
+        is_retweet = full_text.startswith("RT @")
+    else:
+        note_tweet = tweet.get("note_tweet", {})
+        if isinstance(note_tweet, dict):
+            note_results = note_tweet.get("note_tweet_results", {})
+            if isinstance(note_results, dict):
+                note_result = note_results.get("result", {})
+                if isinstance(note_result, dict):
+                    note_text = note_result.get("text", "")
+                    if note_text:
+                        full_text = note_text
+                        is_retweet = False
+                        return normalize_text(full_text), is_retweet
+        is_retweet = full_text.startswith("RT @")
 
-    if has_retweet_structure:
-        result = retweeted_result.get("result", {})
-        if result:
-            rt_legacy = result.get("legacy", {})
-            rt_text = rt_legacy.get("full_text", "") if isinstance(rt_legacy, dict) else ""
-            if rt_text:
-                return normalize_text(rt_text), True
-
-    if full_text and len(full_text) > 10:
-        return normalize_text(full_text), full_text.startswith("RT @")
-
-    note_tweet = tweet.get("note_tweet", {})
-    if isinstance(note_tweet, dict):
-        note_results = note_tweet.get("note_tweet_results", {})
-        if isinstance(note_results, dict):
-            note_result = note_results.get("result", {})
-            if isinstance(note_result, dict):
-                note_text = note_result.get("text", "")
-                if note_text:
-                    return normalize_text(note_text), False
-
-    return normalize_text(full_text) if full_text else "", full_text.startswith("RT @")
+    return normalize_text(full_text) if full_text else "", is_retweet
 
 
 def extract_tweet_row(t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -306,6 +337,30 @@ def extract_tweet_row(t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     retweeted_from_screen_name, retweeted_tweet_id, _ = extract_retweet_metadata(t, full_text)
 
+    quoted_result = t.get("quoted_status_result", {})
+    quoted_tweet_id = ""
+    quoted_screen_name = ""
+    quoted_full_text = ""
+    quoted_tweet_url = ""
+    if quoted_result and isinstance(quoted_result, dict):
+        q_result = quoted_result.get("result", {})
+        if q_result and isinstance(q_result, dict):
+            quoted_tweet_id = str(q_result.get("rest_id", ""))
+
+            q_core = q_result.get("core", {})
+            q_user_results = q_core.get("user_results", {})
+            q_user_result = q_user_results.get("result", {})
+            q_user_core = q_user_result.get("core", {})
+            if isinstance(q_user_core, dict):
+                quoted_screen_name = q_user_core.get("screen_name", "")
+
+            q_legacy_full = q_result.get("legacy", {})
+            if isinstance(q_legacy_full, dict):
+                quoted_full_text = normalize_text(q_legacy_full.get("full_text", ""))
+
+            if quoted_tweet_id and quoted_screen_name:
+                quoted_tweet_url = f"https://x.com/{quoted_screen_name}/status/{quoted_tweet_id}"
+
     view_count_raw = deep_get(t, ["views", "count"], "0")
     view_count = safe_int(view_count_raw, 0)
     view_count_available = 0 if view_count_raw == "0" or view_count_raw == 0 else 1
@@ -334,6 +389,15 @@ def extract_tweet_row(t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "urls": list_join(urls),
         "retweeted_from_screen_name": retweeted_from_screen_name,
         "retweeted_tweet_id": retweeted_tweet_id,
+        "retweeted_tweet_url": (
+            f"https://x.com/{retweeted_from_screen_name}/status/{retweeted_tweet_id}"
+            if retweeted_tweet_id and retweeted_from_screen_name
+            else ""
+        ),
+        "quoted_tweet_id": quoted_tweet_id,
+        "quoted_screen_name": quoted_screen_name,
+        "quoted_full_text": quoted_full_text,
+        "quoted_tweet_url": quoted_tweet_url,
         "tweet_url": f"https://x.com/{screen_name}/status/{tweet_id}"
         if screen_name
         else f"https://x.com/i/web/status/{tweet_id}",
@@ -419,6 +483,11 @@ def convert_json_to_csv(
         "urls",
         "retweeted_from_screen_name",
         "retweeted_tweet_id",
+        "retweeted_tweet_url",
+        "quoted_tweet_id",
+        "quoted_screen_name",
+        "quoted_full_text",
+        "quoted_tweet_url",
         "tweet_url",
     ]
 
