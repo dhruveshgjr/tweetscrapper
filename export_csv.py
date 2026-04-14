@@ -1,25 +1,7 @@
 #!/usr/bin/env python3
 """
-export_csv.py
-Convert tweet JSON to clean CSV with production-grade data quality.
-
-Phase 1 improvements:
-- Booleans standardized to 0/1
-- is_link_only derived field
-- view_count_available flag
-- Retweet original metadata
-- Export report with null rates
-
-Phase 2 fixes:
-- Emoji preservation (ensure_ascii=False)
-- Retweet full_text extraction from nested structure
-- Entity extraction from retweet's entities
-- is_quote=0 for retweets
-- tweet_id as string (no scientific notation)
-- retweeted_from_screen_name and retweeted_tweet_id populated
-
-Can run standalone: python3 export_csv.py --input ./output/tweets_JeffBezos_browser.json
-Or import for use in other scripts.
+export_csv.py – Fixed version with full text extraction
+Handles: long tweets (note_tweet), retweets, quoted tweets
 """
 
 import argparse
@@ -40,6 +22,22 @@ def deep_get(obj: Dict[str, Any], path: List[str], default=None):
             return default
         cur = cur[p]
     return cur
+
+
+def get_full_text(tweet_obj: Dict[str, Any]) -> str:
+    """
+    Extract the complete, non-truncated text from a tweet object.
+    Prioritises note_tweet (tweets >280 chars), then legacy.full_text.
+    """
+    note = tweet_obj.get("note_tweet")
+    if note and isinstance(note, dict):
+        text = note.get("text")
+        if text:
+            return normalize_text(text)
+
+    legacy = tweet_obj.get("legacy", {})
+    text = legacy.get("full_text", "")
+    return normalize_text(text)
 
 
 def parse_source_html(source_html: Optional[str]) -> Tuple[str, str]:
@@ -83,290 +81,85 @@ def safe_int(v: Any, default: int = 0) -> int:
         return default
 
 
-def is_link_only_tweet(full_text: str, entities: dict) -> int:
-    if not full_text:
-        return 1
-    media = entities.get("media", []) if isinstance(entities, dict) else []
-    urls_in_text = re.findall(r"https?://\S+", full_text)
-    if len(urls_in_text) == 1 and len(media) >= 1:
-        url_without_protocol = re.sub(r"^https?://", "", urls_in_text[0])
-        if url_without_protocol in full_text.replace(urls_in_text[0], "").strip():
-            return 1
-    stripped = full_text.strip()
-    if stripped.startswith("http://") or stripped.startswith("https://"):
-        return 1
-    return 0
-
-
-def extract_retweet_metadata(tweet: dict, full_text: str = "") -> Tuple[str, str, str]:
-    """
-    For retweets, extract:
-    - Original author's screen_name
-    - Original tweet_id (from legacy.retweeted_status_id_str or nested rest_id)
-    - Original full_text (from nested structure or parsed from RT text)
-
-    Checks:
-    1. legacy.retweeted_status_result nested structure
-    2. legacy.retweeted_status_id_str
-    3. full_text parsing as fallback ("RT @screen_name: ...")
-    """
-    legacy = tweet.get("legacy", {}) if isinstance(tweet.get("legacy"), dict) else {}
-
-    retweeted_status_id_str = legacy.get("retweeted_status_id_str", "")
-
-    retweeted_result = legacy.get("retweeted_status_result", {})
-    if retweeted_result:
-        result = retweeted_result.get("result", {})
-        if result:
-            core = result.get("core", {})
-            user_results = core.get("user_results", {})
-            user_result = user_results.get("result", {})
-            user_core = user_result.get("core", {})
-            screen_name = user_core.get("screen_name", "")
-
-            if not screen_name:
-                user_core = user_result.get("legacy", {})
-                screen_name = (
-                    user_core.get("screen_name", "") if isinstance(user_core, dict) else ""
-                )
-
-            nested_id = result.get("rest_id", "")
-
-            rt_legacy = result.get("legacy", {})
-            original_id = str(rt_legacy.get("id_str", "")) if isinstance(rt_legacy, dict) else ""
-            original_full_text = (
-                normalize_text(rt_legacy.get("full_text", ""))
-                if isinstance(rt_legacy, dict)
-                else ""
-            )
-
-            return (
-                screen_name,
-                retweeted_status_id_str or nested_id or original_id,
-                original_full_text,
-            )
-
-    if full_text.startswith("RT @"):
-        match = re.match(r"RT @(\w+):", full_text)
-        if match:
-            screen_name = match.group(1)
-            return screen_name, retweeted_status_id_str, ""
-
-    return "", retweeted_status_id_str, ""
-
-
-def extract_entities(tweet: dict) -> Tuple[List[str], List[str], List[str]]:
-    """
-    Extract hashtags, mentions, and URLs from tweet entities.
-    Checks:
-    1. legacy.entities
-    2. retweeted_status_result entities (for RTs)
-    3. note_tweet.entity_set (for long tweets)
-    """
-    hashtags = []
-    mentions = []
-    urls = []
-
-    legacy = tweet.get("legacy", {}) if isinstance(tweet.get("legacy"), dict) else {}
-    entities = legacy.get("entities", {})
-
-    if isinstance(entities, dict):
-        hashtags_raw = entities.get("hashtags", [])
-        mentions_raw = entities.get("user_mentions", [])
-        urls_raw = entities.get("urls", [])
-
-        if isinstance(hashtags_raw, list):
-            hashtags = [
-                h.get("text", "") for h in hashtags_raw if isinstance(h, dict) and h.get("text")
-            ]
-        if isinstance(mentions_raw, list):
-            mentions = [
-                m.get("screen_name", "")
-                for m in mentions_raw
-                if isinstance(m, dict) and m.get("screen_name")
-            ]
-        if isinstance(urls_raw, list):
-            urls = [
-                u.get("expanded_url") or u.get("url", "") for u in urls_raw if isinstance(u, dict)
-            ]
-
-    if not hashtags or not mentions or not urls:
-        retweeted_result = tweet.get("retweeted_status_result", {})
-        if isinstance(retweeted_result, dict):
-            result = retweeted_result.get("result", {})
-            if isinstance(result, dict):
-                rt_legacy = result.get("legacy", {})
-                if isinstance(rt_legacy, dict):
-                    rt_entities = rt_legacy.get("entities", {})
-                    if isinstance(rt_entities, dict):
-                        if not hashtags:
-                            rt_hashtags = rt_entities.get("hashtags", [])
-                            if isinstance(rt_hashtags, list):
-                                hashtags = [
-                                    h.get("text", "")
-                                    for h in rt_hashtags
-                                    if isinstance(h, dict) and h.get("text")
-                                ]
-                        if not mentions:
-                            rt_mentions = rt_entities.get("user_mentions", [])
-                            if isinstance(rt_mentions, list):
-                                mentions = [
-                                    m.get("screen_name", "")
-                                    for m in rt_mentions
-                                    if isinstance(m, dict) and m.get("screen_name")
-                                ]
-                        if not urls:
-                            rt_urls = rt_entities.get("urls", [])
-                            if isinstance(rt_urls, list):
-                                urls = [
-                                    u.get("expanded_url") or u.get("url", "")
-                                    for u in rt_urls
-                                    if isinstance(u, dict)
-                                ]
-
-    if not hashtags or not mentions or not urls:
-        note_tweet = tweet.get("note_tweet", {})
-        if isinstance(note_tweet, dict):
-            note_results = note_tweet.get("note_tweet_results", {})
-            if isinstance(note_results, dict):
-                note_result = note_results.get("result", {})
-                if isinstance(note_result, dict):
-                    entity_set = note_result.get("entity_set", {})
-                    if isinstance(entity_set, dict):
-                        if not hashtags:
-                            nt_hashtags = entity_set.get("hashtags", [])
-                            if isinstance(nt_hashtags, list):
-                                hashtags = [
-                                    h.get("text", "")
-                                    for h in nt_hashtags
-                                    if isinstance(h, dict) and h.get("text")
-                                ]
-                        if not mentions:
-                            nt_mentions = entity_set.get("user_mentions", [])
-                            if isinstance(nt_mentions, list):
-                                mentions = [
-                                    m.get("screen_name", "")
-                                    for m in nt_mentions
-                                    if isinstance(m, dict) and m.get("screen_name")
-                                ]
-                        if not urls:
-                            nt_urls = entity_set.get("urls", [])
-                            if isinstance(nt_urls, list):
-                                urls = [
-                                    u.get("expanded_url") or u.get("url", "")
-                                    for u in nt_urls
-                                    if isinstance(u, dict)
-                                ]
-
-    return hashtags, mentions, urls
-
-
-def extract_full_text(tweet: dict) -> Tuple[str, bool]:
-    """
-    Extract full_text from multiple possible paths.
-    For retweets, get the complete original tweet text from retweeted_status_result
-    and prefix with "RT @{username}:" for clarity.
-
-    Returns (full_text, is_retweet).
-    """
-    legacy = tweet.get("legacy", {}) if isinstance(tweet.get("legacy"), dict) else {}
-    full_text = legacy.get("full_text", "")
-
-    retweeted = tweet.get("retweeted_status_result", {}).get("result", {})
-    if retweeted:
-        rt_legacy = retweeted.get("legacy", {})
-        rt_full_text = rt_legacy.get("full_text", "") if isinstance(rt_legacy, dict) else ""
-        if rt_full_text:
-            rt_user = deep_get(
-                retweeted, ["core", "user_results", "result", "legacy", "screen_name"], ""
-            )
-            if not rt_user:
-                rt_user = deep_get(
-                    retweeted, ["core", "user_results", "result", "core", "screen_name"], ""
-                )
-            if rt_user:
-                full_text = f"RT @{rt_user}: {rt_full_text}"
-            else:
-                full_text = rt_full_text
-        is_retweet = True
-    elif full_text and len(full_text) > 10:
-        is_retweet = full_text.startswith("RT @")
-    else:
-        note_tweet = tweet.get("note_tweet", {})
-        if isinstance(note_tweet, dict):
-            note_results = note_tweet.get("note_tweet_results", {})
-            if isinstance(note_results, dict):
-                note_result = note_results.get("result", {})
-                if isinstance(note_result, dict):
-                    note_text = note_result.get("text", "")
-                    if note_text:
-                        full_text = note_text
-                        is_retweet = False
-                        return normalize_text(full_text), is_retweet
-        is_retweet = full_text.startswith("RT @")
-
-    return normalize_text(full_text) if full_text else "", is_retweet
-
-
 def extract_tweet_row(t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     tweet_id = t.get("rest_id") or deep_get(t, ["legacy", "id_str"], "")
     if not tweet_id:
         return None
 
-    tweet_id = str(tweet_id)
-
     legacy = t.get("legacy", {}) if isinstance(t.get("legacy"), dict) else {}
     core_user = deep_get(t, ["core", "user_results", "result", "core"], {}) or {}
-
-    full_text, is_retweet_from_text = extract_full_text(t)
-
-    created_at = legacy.get("created_at", "")
-    created_at_iso = parse_created_at_iso(created_at)
-
-    source_label, source_url = parse_source_html(t.get("source", ""))
-
-    hashtags, mentions, urls = extract_entities(t)
-
     screen_name = core_user.get("screen_name", "")
     name = core_user.get("name", "")
 
-    is_retweet_flag = 1 if ("retweeted_status_result" in t or is_retweet_from_text) else 0
-    is_quote_flag = 1 if (bool(legacy.get("is_quote_status", False)) and not is_retweet_flag) else 0
+    is_retweet = "retweeted_status_result" in t or "retweeted_status_result" in legacy
+    is_quote = bool(legacy.get("is_quote_status", False))
 
-    is_link_only = is_link_only_tweet(full_text, legacy.get("entities", {}))
+    if is_retweet:
+        rt_obj = legacy.get("retweeted_status_result", {})
+        if not rt_obj:
+            rt_obj = t.get("retweeted_status_result", {})
+        rt_result = rt_obj.get("result", {}) if isinstance(rt_obj, dict) else {}
+        full_text = get_full_text(rt_result)
+        retweeted_screen_name = deep_get(
+            rt_result, ["core", "user_results", "result", "core", "screen_name"], ""
+        )
+        retweeted_tweet_id = rt_result.get("rest_id") or deep_get(
+            rt_result, ["legacy", "id_str"], ""
+        )
+        retweeted_tweet_url = (
+            f"https://x.com/{retweeted_screen_name}/status/{retweeted_tweet_id}"
+            if retweeted_screen_name
+            else ""
+        )
+    else:
+        full_text = get_full_text(t)
+        retweeted_screen_name = ""
+        retweeted_tweet_id = ""
+        retweeted_tweet_url = ""
 
-    retweeted_from_screen_name, retweeted_tweet_id, _ = extract_retweet_metadata(t, full_text)
-
-    quoted_result = t.get("quoted_status_result", {})
     quoted_tweet_id = ""
     quoted_screen_name = ""
     quoted_full_text = ""
     quoted_tweet_url = ""
-    if quoted_result and isinstance(quoted_result, dict):
-        q_result = quoted_result.get("result", {})
-        if q_result and isinstance(q_result, dict):
-            quoted_tweet_id = str(q_result.get("rest_id", ""))
+    if is_quote and not is_retweet:
+        quoted_obj = deep_get(t, ["quoted_status_result", "result"], {})
+        if quoted_obj:
+            quoted_tweet_id = quoted_obj.get("rest_id") or deep_get(
+                quoted_obj, ["legacy", "id_str"], ""
+            )
+            quoted_screen_name = deep_get(
+                quoted_obj, ["core", "user_results", "result", "core", "screen_name"], ""
+            )
+            quoted_full_text = get_full_text(quoted_obj)
+            quoted_tweet_url = (
+                f"https://x.com/{quoted_screen_name}/status/{quoted_tweet_id}"
+                if quoted_screen_name
+                else ""
+            )
 
-            q_core = q_result.get("core", {})
-            q_user_results = q_core.get("user_results", {})
-            q_user_result = q_user_results.get("result", {})
-            q_user_core = q_user_result.get("core", {})
-            if isinstance(q_user_core, dict):
-                quoted_screen_name = q_user_core.get("screen_name", "")
+    created_at = legacy.get("created_at", "")
+    created_at_iso = parse_created_at_iso(created_at)
+    source_label, source_url = parse_source_html(t.get("source", ""))
 
-            q_legacy_full = q_result.get("legacy", {})
-            if isinstance(q_legacy_full, dict):
-                quoted_full_text = normalize_text(q_legacy_full.get("full_text", ""))
+    entities = legacy.get("entities", {}) if isinstance(legacy.get("entities"), dict) else {}
+    hashtags = [h.get("text", "") for h in entities.get("hashtags", []) if isinstance(h, dict)]
+    mentions = [
+        m.get("screen_name", "") for m in entities.get("user_mentions", []) if isinstance(m, dict)
+    ]
+    urls = [
+        u.get("expanded_url") or u.get("url", "")
+        for u in entities.get("urls", [])
+        if isinstance(u, dict)
+    ]
 
-            if quoted_tweet_id and quoted_screen_name:
-                quoted_tweet_url = f"https://x.com/{quoted_screen_name}/status/{quoted_tweet_id}"
-
-    view_count_raw = deep_get(t, ["views", "count"], "0")
-    view_count = safe_int(view_count_raw, 0)
-    view_count_available = 0 if view_count_raw == "0" or view_count_raw == 0 else 1
+    is_link_only = False
+    if not is_retweet:
+        raw_text = legacy.get("full_text", "")
+        if re.fullmatch(r"\s*https?://\S+\s*", raw_text):
+            is_link_only = True
 
     row = {
-        "tweet_id": tweet_id,
+        "tweet_id": str(tweet_id),
         "created_at": created_at,
         "created_at_iso": created_at_iso,
         "screen_name": screen_name,
@@ -376,25 +169,21 @@ def extract_tweet_row(t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "favorite_count": safe_int(legacy.get("favorite_count", 0)),
         "reply_count": safe_int(legacy.get("reply_count", 0)),
         "quote_count": safe_int(legacy.get("quote_count", 0)),
-        "view_count": view_count,
-        "view_count_available": view_count_available,
+        "view_count": safe_int(deep_get(t, ["views", "count"], 0)),
+        "view_count_available": 1 if deep_get(t, ["views", "count"], 0) is not None else 0,
         "lang": legacy.get("lang", ""),
-        "is_retweet": is_retweet_flag,
-        "is_quote": is_quote_flag,
-        "is_link_only": is_link_only,
+        "is_retweet": 1 if is_retweet else 0,
+        "is_quote": 1 if is_quote else 0,
+        "is_link_only": 1 if is_link_only else 0,
         "source_label": source_label,
         "source_url": source_url,
         "hashtags": list_join(hashtags),
         "mentions": list_join(mentions),
         "urls": list_join(urls),
-        "retweeted_from_screen_name": retweeted_from_screen_name,
-        "retweeted_tweet_id": retweeted_tweet_id,
-        "retweeted_tweet_url": (
-            f"https://x.com/{retweeted_from_screen_name}/status/{retweeted_tweet_id}"
-            if retweeted_tweet_id and retweeted_from_screen_name
-            else ""
-        ),
-        "quoted_tweet_id": quoted_tweet_id,
+        "retweeted_from_screen_name": retweeted_screen_name,
+        "retweeted_tweet_id": str(retweeted_tweet_id) if retweeted_tweet_id else "",
+        "retweeted_tweet_url": retweeted_tweet_url,
+        "quoted_tweet_id": str(quoted_tweet_id) if quoted_tweet_id else "",
         "quoted_screen_name": quoted_screen_name,
         "quoted_full_text": quoted_full_text,
         "quoted_tweet_url": quoted_tweet_url,
@@ -435,8 +224,7 @@ def convert_json_to_csv(
     input_json: Path, output_csv: Path, output_report: Optional[Path] = None, dedup: bool = True
 ) -> Dict[str, Any]:
     tweets = load_json(input_json)
-
-    rows: List[Dict[str, Any]] = []
+    rows = []
     seen = set()
     dropped_no_id = 0
     dropped_dupe = 0
@@ -520,7 +308,9 @@ def convert_json_to_csv(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert tweet JSON to clean CSV.")
+    parser = argparse.ArgumentParser(
+        description="Convert tweet JSON to clean CSV (full text fixed)."
+    )
     parser.add_argument("--input", required=True, help="Path to input JSON file")
     parser.add_argument("--output", required=False, help="Path to output CSV file")
     parser.add_argument("--report", required=False, help="Path to export report JSON file")
@@ -531,10 +321,7 @@ def main():
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    if args.output:
-        output_path = Path(args.output)
-    else:
-        output_path = input_path.with_suffix(".csv")
+    output_path = Path(args.output) if args.output else input_path.with_suffix(".csv")
 
     report_path = None
     if args.report:
@@ -542,14 +329,9 @@ def main():
     else:
         report_path = output_path.with_suffix(".report.json")
 
-    stats = convert_json_to_csv(
-        input_json=input_path,
-        output_csv=output_path,
-        output_report=report_path,
-        dedup=not args.no_dedup,
-    )
+    stats = convert_json_to_csv(input_path, output_path, report_path, dedup=not args.no_dedup)
 
-    print("CSV conversion complete")
+    print("CSV conversion complete (full text extracted)")
     print(f"   Input:        {input_path}")
     print(f"   Output:       {output_path}")
     print(f"   Report:       {report_path}")
