@@ -15,6 +15,8 @@ Usage:
 import argparse
 import asyncio
 import json
+from pathlib import Path
+
 from patchright.async_api import async_playwright
 
 from config import (
@@ -25,6 +27,8 @@ from config import (
     clean_tweet,
     deduplicate,
 )
+
+from export_csv import convert_json_to_csv
 
 SCROLL_ROUNDS = 15
 SCROLL_DELAY_BASE = 2.5
@@ -246,6 +250,13 @@ async def intercept_graphql(
 
     output_file = save_json(unique, f"tweets_{target_user}_browser.json")
     log.info("Saved to %s", output_file)
+
+    csv_path = Path(output_file).with_suffix(".csv")
+    try:
+        stats = convert_json_to_csv(Path(output_file), csv_path, dedup=True)
+        log.info("CSV: %d tweets → %s", stats["written_count"], csv_path)
+    except Exception as e:
+        log.warning("CSV conversion failed (JSON still valid): %s", e)
 
     cleaned = [clean_tweet(t) for t in unique[:max_tweets]]
     print(f"\nCollected {len(cleaned)} tweets from @{target_user}")
