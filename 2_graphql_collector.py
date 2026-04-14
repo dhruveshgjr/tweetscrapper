@@ -4,12 +4,12 @@ Intercept GraphQL responses from a Twitter/X profile page.
 Week 1: No login (public). Week 2: Authenticated session.
 
 Usage:
-  python 2_graphql_collector.py                  # authenticated, visible browser
-  python 2_graphql_collector.py --headless       # authenticated, headless
-  python 2_graphql_collector.py --no-login       # public (no session)
-  python 2_graphql_collector.py --user elonmusk  # custom target
-  python 2_graphql_collector.py --max 200        # collect up to 200 tweets
-  python 2_graphql_collector.py --debug          # pause before close, show URLs
+  python3 2_graphql_collector.py                  # authenticated, visible browser
+  python3 2_graphql_collector.py --headless       # authenticated, headless
+  python3 2_graphql_collector.py --no-login       # public (no session)
+  python3 2_graphql_collector.py --user elonmusk  # custom target
+  python3 2_graphql_collector.py --max 200        # collect up to 200 tweets
+  python3 2_graphql_collector.py --debug          # pause before close, show URLs
 """
 
 import argparse
@@ -51,22 +51,89 @@ TWEET_ENDPOINTS = [
 ]
 
 
+def get_author_screen_name(tweet: dict) -> str:
+    """
+    Extract the screen_name of the tweet's author.
+    Checks multiple possible paths in the nested JSON structure.
+    """
+    core = tweet.get("core", {})
+    user_results = core.get("user_results", {})
+    result = user_results.get("result", {})
+
+    if result.get("__typename") == "User":
+        core_data = result.get("core", {})
+        if core_data.get("screen_name"):
+            return core_data.get("screen_name", "")
+        if core_data.get("legacy", {}).get("screen_name"):
+            return core_data.get("legacy", {}).get("screen_name", "")
+
+    if result.get("__typename") == "User":
+        legacy = result.get("legacy", {})
+        if legacy.get("screen_name"):
+            return legacy.get("screen_name", "")
+
+    return ""
+
+
 def extract_tweets_from_response(data):
+    """
+    Recursively extract all tweet objects from a GraphQL response.
+    This collects raw tweet objects - filtering by author happens later.
+    Handles three cases:
+    1. Tweet wrapped in tweet_results.result
+    2. Direct tweet object with legacy.full_text
+    3. Nested tweets within retweeted_status_result or quoted_status_result
+    """
     tweets = []
     if isinstance(data, dict):
         if "tweet_results" in data:
             result = data["tweet_results"].get("result")
             if result:
                 tweets.append(result)
+
         if "legacy" in data and "full_text" in data.get("legacy", {}):
             if data not in tweets:
                 tweets.append(data)
+
         for v in data.values():
             tweets.extend(extract_tweets_from_response(v))
     elif isinstance(data, list):
         for item in data:
             tweets.extend(extract_tweets_from_response(item))
     return tweets
+
+
+def filter_own_tweets(tweets: list, target_screen_name: str) -> list:
+    """
+    Filter tweets to keep only those authored by the target user.
+
+    Problem: The recursive extractor grabs EVERY tweet object it finds, including
+    tweets nested inside retweeted_status_result and quoted_status_result.
+    These belong to OTHER users (NASA, JonErlichman, etc.) and should not be
+    collected as separate entries.
+
+    Solution: Only keep tweets where the author screen_name matches the target user.
+
+    Additionally, extract quoted tweet text into a field for reference, but do NOT
+    create a separate row for the quoted tweet.
+
+    Args:
+        tweets: List of raw tweet objects from extraction
+        target_screen_name: The username whose tweets we want to collect
+
+    Returns:
+        Filtered list containing only the target user's own tweets
+    """
+    own_tweets = []
+    for tweet in tweets:
+        author = get_author_screen_name(tweet)
+
+        if author and author.lower() == target_screen_name.lower():
+            own_tweets.append(tweet)
+        else:
+            pass
+
+    return own_tweets
 
 
 def is_tweet_endpoint(url: str) -> bool:
@@ -136,8 +203,6 @@ async def intercept_graphql(
         vis = "headless" if headless else "visible"
         log.info("Using %s session [%s]", mode, vis)
 
-        # Strategy: navigate to the profile's "posts" tab directly
-        # X.com sometimes loads the Highlights tab by default, which doesn't trigger UserTweets
         target_url = f"https://x.com/{target_user}"
         log.info("Navigating to %s", target_url)
 
@@ -146,23 +211,18 @@ async def intercept_graphql(
         except Exception as e:
             log.warning("Navigation issue (continuing): %s", e)
 
-        # Wait for initial hydration
         await asyncio.sleep(4)
 
         current_url = page.url
         log.info("Page URL after load: %s", current_url)
 
-        # Try clicking the "Posts" tab to force the UserTweets endpoint
-        # X.com profile tabs: Posts, Replies, Highlights, Media, Likes
         try:
-            # Click the "Posts" tab link — this forces the UserTweets GraphQL call
             posts_tab = page.locator('a[href$="/posts"], a[href$="/posts/with_replies"]').first
             if await posts_tab.count() > 0:
                 await posts_tab.click()
                 log.info("Clicked 'Posts' tab")
                 await asyncio.sleep(3)
             else:
-                # Fallback: try the tab by role
                 tabs = page.locator('a[role="tab"]')
                 tab_count = await tabs.count()
                 log.info("Found %d tab links on page", tab_count)
@@ -173,17 +233,14 @@ async def intercept_graphql(
         except Exception as e:
             log.info("Tab click attempt: %s (will scroll anyway)", e)
 
-        # Check if we have articles now
         try:
             await page.wait_for_selector("article", timeout=15000)
             log.info("Found tweet articles on page")
         except Exception:
             log.warning("No <article> elements found yet")
-            # One more attempt: scroll a bit to trigger lazy loading
             await page.evaluate("window.scrollBy(0, 500)")
             await asyncio.sleep(2)
 
-        # Progressive scrolling with adaptive behavior
         no_new_tweets_count = 0
         for i in range(scroll_rounds):
             prev_count = len(tweets_data)
@@ -195,7 +252,6 @@ async def intercept_graphql(
             new_count = len(tweets_data)
             if new_count == prev_count:
                 no_new_tweets_count += 1
-                # If no new tweets for 3 consecutive scrolls, try keyboard approach
                 if no_new_tweets_count >= 3:
                     log.info("No new tweets for 3 scrolls — trying End key")
                     await page.keyboard.press("End")
@@ -233,22 +289,25 @@ async def intercept_graphql(
         unique = deduplicate(tweets_data)
         log.info("Collected %d raw tweets, %d unique after dedup", len(tweets_data), len(unique))
 
+        own_tweets = filter_own_tweets(unique, target_user)
+        log.info("Filtered to %d own tweets for @%s", len(own_tweets), target_user)
+
         if use_session:
             await context.close()
         else:
             await browser.close()
 
-    if not unique:
+    if not own_tweets:
         log.error("No tweets collected. Possible causes:")
         log.error("  1. Session expired — re-run: python 1_authenticator.py")
         log.error("  2. X.com showing Highlights tab — script now tries to click Posts tab")
         log.error("  3. Try with --debug to see which GraphQL endpoints are hit")
         print("\nNo tweets collected. Try:")
-        print("  python 2_graphql_collector.py --debug         # see what endpoints are called")
-        print("  python 2_graphql_collector.py --no-login      # without session")
+        print("  python3 2_graphql_collector.py --debug         # see what endpoints are called")
+        print("  python3 2_graphql_collector.py --no-login      # without session")
         return []
 
-    output_file = save_json(unique, f"tweets_{target_user}_browser.json")
+    output_file = save_json(own_tweets, f"tweets_{target_user}_browser.json")
     log.info("Saved to %s", output_file)
 
     csv_path = Path(output_file).with_suffix(".csv")
@@ -258,14 +317,14 @@ async def intercept_graphql(
     except Exception as e:
         log.warning("CSV conversion failed (JSON still valid): %s", e)
 
-    cleaned = [clean_tweet(t) for t in unique[:max_tweets]]
+    cleaned = [clean_tweet(t) for t in own_tweets[:max_tweets]]
     print(f"\nCollected {len(cleaned)} tweets from @{target_user}")
     for idx, t in enumerate(cleaned[:5]):
         print(f"  [{idx + 1}] {t['created_at']} | {t['text'][:80]}...")
     if len(cleaned) > 5:
         print(f"  ... and {len(cleaned) - 5} more (see {output_file})")
 
-    return unique
+    return own_tweets
 
 
 def main():
