@@ -78,7 +78,7 @@ def get_author_screen_name(tweet: dict) -> str:
 def extract_tweets_from_response(data):
     """
     Recursively extract all tweet objects from a GraphQL response.
-    This collects raw tweet objects - filtering by author happens later.
+    This collects raw tweet objects - filtering by author happens immediately after.
     Handles three cases:
     1. Tweet wrapped in tweet_results.result
     2. Direct tweet object with legacy.full_text
@@ -101,39 +101,6 @@ def extract_tweets_from_response(data):
         for item in data:
             tweets.extend(extract_tweets_from_response(item))
     return tweets
-
-
-def filter_own_tweets(tweets: list, target_screen_name: str) -> list:
-    """
-    Filter tweets to keep only those authored by the target user.
-
-    Problem: The recursive extractor grabs EVERY tweet object it finds, including
-    tweets nested inside retweeted_status_result and quoted_status_result.
-    These belong to OTHER users (NASA, JonErlichman, etc.) and should not be
-    collected as separate entries.
-
-    Solution: Only keep tweets where the author screen_name matches the target user.
-
-    Additionally, extract quoted tweet text into a field for reference, but do NOT
-    create a separate row for the quoted tweet.
-
-    Args:
-        tweets: List of raw tweet objects from extraction
-        target_screen_name: The username whose tweets we want to collect
-
-    Returns:
-        Filtered list containing only the target user's own tweets
-    """
-    own_tweets = []
-    for tweet in tweets:
-        author = get_author_screen_name(tweet)
-
-        if author and author.lower() == target_screen_name.lower():
-            own_tweets.append(tweet)
-        else:
-            pass
-
-    return own_tweets
 
 
 def is_tweet_endpoint(url: str) -> bool:
@@ -187,9 +154,17 @@ async def intercept_graphql(
             try:
                 data = await response.json()
                 extracted = extract_tweets_from_response(data)
+
                 for t in extracted:
                     tid = t.get("rest_id") or t.get("legacy", {}).get("id_str")
-                    if tid and tid not in seen_ids:
+                    if not tid:
+                        continue
+
+                    author = get_author_screen_name(t)
+                    if author.lower() != target_user.lower():
+                        continue
+
+                    if tid not in seen_ids:
                         seen_ids.add(tid)
                         tweets_data.append(t)
                         if len(tweets_data) % 10 == 0:
@@ -286,18 +261,14 @@ async def intercept_graphql(
             log.info("Total intercepted URLs: %d", len(tweet_graphql_urls))
             input("Press Enter to close browser...")
 
-        unique = deduplicate(tweets_data)
-        log.info("Collected %d raw tweets, %d unique after dedup", len(tweets_data), len(unique))
-
-        own_tweets = filter_own_tweets(unique, target_user)
-        log.info("Filtered to %d own tweets for @%s", len(own_tweets), target_user)
+        log.info("Collected %d raw tweets", len(tweets_data))
 
         if use_session:
             await context.close()
         else:
             await browser.close()
 
-    if not own_tweets:
+    if not tweets_data:
         log.error("No tweets collected. Possible causes:")
         log.error("  1. Session expired — re-run: python 1_authenticator.py")
         log.error("  2. X.com showing Highlights tab — script now tries to click Posts tab")
@@ -307,7 +278,7 @@ async def intercept_graphql(
         print("  python3 2_graphql_collector.py --no-login      # without session")
         return []
 
-    output_file = save_json(own_tweets, f"tweets_{target_user}_browser.json")
+    output_file = save_json(tweets_data, f"tweets_{target_user}_browser.json")
     log.info("Saved to %s", output_file)
 
     csv_path = Path(output_file).with_suffix(".csv")
@@ -317,14 +288,14 @@ async def intercept_graphql(
     except Exception as e:
         log.warning("CSV conversion failed (JSON still valid): %s", e)
 
-    cleaned = [clean_tweet(t) for t in own_tweets[:max_tweets]]
+    cleaned = [clean_tweet(t) for t in tweets_data[:max_tweets]]
     print(f"\nCollected {len(cleaned)} tweets from @{target_user}")
     for idx, t in enumerate(cleaned[:5]):
         print(f"  [{idx + 1}] {t['created_at']} | {t['text'][:80]}...")
     if len(cleaned) > 5:
         print(f"  ... and {len(cleaned) - 5} more (see {output_file})")
 
-    return own_tweets
+    return tweets_data
 
 
 def main():
