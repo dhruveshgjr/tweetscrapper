@@ -83,7 +83,7 @@ def json_to_csv(input_file: str, output_file: str) -> str:
     cleaned.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     log.info("Exporting %d tweets to %s", len(cleaned), output_file)
 
-    with open(output_file, "w", newline="", encoding="utf-8") as f:
+    with open(output_file, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(cleaned)

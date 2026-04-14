@@ -282,9 +282,11 @@ async def intercept_graphql(
     log.info("Saved to %s", output_file)
 
     csv_path = Path(output_file).with_suffix(".csv")
+    report_path = csv_path.with_suffix(".report.json")
     try:
-        stats = convert_json_to_csv(Path(output_file), csv_path, dedup=True)
-        log.info("CSV: %d tweets → %s", stats["written_count"], csv_path)
+        stats = convert_json_to_csv(Path(output_file), csv_path, report_path, dedup=True)
+        log.info("CSV: %d tweets → %s", stats["output_rows"], csv_path)
+        log.info("Report: %s", report_path)
     except Exception as e:
         log.warning("CSV conversion failed (JSON still valid): %s", e)
 
