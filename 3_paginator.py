@@ -318,7 +318,19 @@ def main():
     tweets = asyncio.run(paginate_all(args.user, args.max, args.proxy))
 
     if tweets:
-        print(f"\nCollected {len(tweets)} unique tweets")
+        output_file = save_json(tweets, f"tweets_{args.user}_browser.json")
+        log.info("Saved to %s", output_file)
+
+        csv_path = Path(output_file).with_suffix(".csv")
+        try:
+            from export_csv import convert_json_to_csv
+
+            stats = convert_json_to_csv(Path(output_file), csv_path, dedup=True)
+            log.info("CSV: %d tweets → %s", stats["output_rows"], csv_path)
+        except Exception as e:
+            log.warning("CSV conversion failed (JSON still valid): %s", e)
+
+        print(f"\nCollected {len(tweets)} unique tweets from @{args.user}")
         print(f"Preview (first 3):")
         for i, t in enumerate(tweets[:3]):
             cleaned = clean_tweet(t)
