@@ -27,9 +27,9 @@ from config import (
 )
 from export_csv import convert_json_to_csv
 
-SCROLL_ROUNDS = 120
+SCROLL_ROUNDS = 250  # Aggressive scrolling
 SCROLL_DELAY_BASE = 3.0
-CHECKPOINT_INTERVAL = 250
+CHECKPOINT_INTERVAL = 100  # Validate every 100 tweets
 
 STEALTH_ARGS = [
     "--disable-blink-features=AutomationControlled",
