@@ -51,6 +51,7 @@ KNOWN_USER_IDS = {
     "justinbieber": "27260086",
     "katyperry": "21447363",
     "rihanna": "791753532",
+    "naval": "19514500",
 }
 
 logging.basicConfig(
