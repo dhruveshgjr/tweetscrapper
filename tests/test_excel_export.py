@@ -225,7 +225,16 @@ class TestCsvCompanion:
         lines = content.splitlines()
         header_idx = next(i for i, l in enumerate(lines) if l.startswith('"Tweet ID"'))
         reader = csv.DictReader(lines[header_idx:])
-        got = [r["Tweet ID"] for r in reader if (r.get("Tweet ID") or "").isdigit()]
+
+        def unwrap_excel_text(v: str) -> str:
+            # Export writes IDs as ="<digits>" so Excel keeps them as text.
+            if v.startswith('="') and v.endswith('"'):
+                return v[2:-1]
+            return v
+
+        got = [unwrap_excel_text(r["Tweet ID"]) for r in reader
+               if unwrap_excel_text(r.get("Tweet ID") or "").isdigit()]
+        assert all('"' not in v and '=' not in v for v in got)
         assert sorted(got) == sorted(REAL_IDS)
         assert reader.fieldnames[:4] == ["Tweet ID", "Date", "Clean Dates", "Author"]
 

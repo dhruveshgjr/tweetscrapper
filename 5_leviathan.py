@@ -18,13 +18,39 @@ from pathlib import Path
 
 from patchright.async_api import async_playwright
 
-from config import USER_DATA_DIR, log
+from config import (
+    BROWSER_LOCALE,
+    BROWSER_TIMEZONE,
+    USER_DATA_DIR,
+    cooldown_delay,
+    human_delay,
+    log,
+    page_load_delay,
+    scroll_delay,
+)
+
+try:
+    from session_vault import vault as _vault
+except Exception:
+    _vault = None
+
+
+def _vault_flagged(session_dir: str, reason: str):
+    if _vault is None:
+        return
+    try:
+        _vault.mark_flagged(session_dir, reason=reason)
+    except Exception as e:
+        log.warning("Vault flag failed: %s", e)
 
 DB_PATH = Path("./output/leviathan.db")
 SPLIT_THRESHOLD = 300
 MAX_SCROLLS = 25
 MAX_SLICE_RETRIES = 3
 MAX_CONSEC_FAILS = 8
+RL_BASE_COOLDOWN = 900    # 15 min — matches X's search rate window
+RL_MAX_COOLDOWN = 7200    # 2h cap
+RL_MAX_STREAK = 5         # ~5 escalating windows, then clean resumable stop
 
 
 # --------------------------------------------------------------------------- DB
@@ -44,6 +70,45 @@ def init_db(db_path=DB_PATH):
     return conn
 
 
+def normalize_text_ws(text: str) -> str:
+    if not text:
+        return ""
+    return text.replace("\r", " ").replace("\n", " ").strip()
+
+
+def extract_full_text(t: dict) -> str:
+    """Full tweet text, prioritizing note_tweet (long-form posts).
+
+    Path 1: note_tweet shapes (X Articles / long-form) — direct text,
+      nested note_tweet_results.result.text, or core.text.
+    Path 2: extended_tweet.full_text (older long-form format).
+    Path 3: legacy.full_text (standard tweets).
+    """
+    try:
+        note = t.get("note_tweet", {})
+        if isinstance(note, dict):
+            if note.get("text"):
+                return normalize_text_ws(note["text"])
+            result = (note.get("note_tweet_results") or {}).get("result", {}) or {}
+            if isinstance(result, dict) and result.get("text"):
+                return normalize_text_ws(result["text"])
+            core_text = (note.get("core") or {}).get("text")
+            if core_text:
+                return normalize_text_ws(core_text)
+    except Exception:
+        pass
+
+    try:
+        ext = t.get("extended_tweet", {}) or {}
+        if isinstance(ext, dict) and ext.get("full_text"):
+            return normalize_text_ws(ext["full_text"])
+    except Exception:
+        pass
+
+    legacy = t.get("legacy", {}) or {}
+    return normalize_text_ws(legacy.get("full_text", ""))
+
+
 def save_tweet(conn, t, handle):
     legacy = t.get("legacy", {}) or {}
     user_res = ((t.get("core") or {}).get("user_results") or {}).get("result") or {}
@@ -51,7 +116,7 @@ def save_tweet(conn, t, handle):
     tid = t.get("rest_id") or legacy.get("id_str")
     if not tid:
         return False
-    text = (legacy.get("full_text") or "").replace("\r", " ").replace("\n", " ").strip()
+    text = extract_full_text(t)
     sn = core.get("screen_name") or handle
     views = (t.get("views") or {}).get("count", 0)
     try:
@@ -184,14 +249,15 @@ async def probe_search(page, handle):
         if state["status"] == 200:
             return True
         if state["status"] == 429:
-            wait = random.uniform(240, 420)
+            wait = cooldown_delay(attempt) + 180  # probe-level: long cool
             log.warning("Probe rate-limited. Cooling %.0fs...", wait)
             await asyncio.sleep(wait)
             continue
         if state["status"] in (401, 403):
             log.error("Session search-blocked/logged out. Re-run 1_authenticator.py")
+            _vault_flagged(USER_DATA_DIR, reason=f"HTTP_{state['status']}")
             return False
-        await asyncio.sleep(random.uniform(30, 60))
+        await asyncio.sleep(human_delay(base=45, spread=1.0))
     return False
 
 
@@ -206,6 +272,16 @@ async def scrape_slice_nav(page, conn, handle, s, e):
             return
         if state["status"] is None:
             state["status"] = resp.status
+
+        # SESSION HEALTH: fail fast on silent auth loss / rate limits.
+        if resp.status in (401, 403):
+            log.error("SESSION AUTH FAILURE (HTTP %d). Flagging session.", resp.status)
+            _vault_flagged(USER_DATA_DIR, reason=f"HTTP_{resp.status}")
+            return
+        if resp.status == 429:
+            log.warning("Rate limited on slice %s->%s", s, e)
+            return
+
         if resp.status != 200:
             return
         try:
@@ -232,6 +308,8 @@ async def scrape_slice_nav(page, conn, handle, s, e):
             await asyncio.sleep(1)
         if state["status"] == 429:
             return "RATE_LIMITED", 0
+        if state["status"] in (401, 403):
+            return "SESSION_FLAGGED", 0
         if state["payloads"] == 0:
             return "NO_PAYLOAD", 0
         seen = len(state["tweets"])
@@ -242,7 +320,7 @@ async def scrape_slice_nav(page, conn, handle, s, e):
             except Exception as ex:
                 log.warning("Scroll error %s: %s", s, ex)
                 break
-            await asyncio.sleep(random.uniform(2.0, 3.5))
+            await asyncio.sleep(scroll_delay(i))
             now = len(state["tweets"])
             if now == seen:
                 stale += 1
@@ -273,10 +351,10 @@ async def inject_noise(context):
         log.info("Noise injection (doomscroll home)...")
         page = await context.new_page()
         await page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(random.uniform(8, 15))
+        await asyncio.sleep(page_load_delay())
         for _ in range(random.randint(2, 5)):
             await page.evaluate("window.scrollBy(0, 600)")
-            await asyncio.sleep(random.uniform(1.5, 3.0))
+            await asyncio.sleep(human_delay(base=2.2, spread=1.0))
         await page.close()
     except Exception as e:
         log.warning("Noise failed: %s", e)
@@ -290,10 +368,15 @@ async def run(handle, start, end, headless, noise_interval, slice_days, db_path=
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
             USER_DATA_DIR, headless=headless, viewport={"width": 1280, "height": 800},
-            args=["--disable-blink-features=AutomationControlled"])
+            args=["--disable-blink-features=AutomationControlled",
+                  "--no-sandbox",
+                  "--disable-dev-shm-usage",
+                  "--disable-infobars"],
+            timezone_id=BROWSER_TIMEZONE,
+            locale=BROWSER_LOCALE)
         page = context.pages[0] if context.pages else await context.new_page()
         await page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(4)
+        await asyncio.sleep(page_load_delay())
         if not await probe_search(page, handle):
             await context.close()
             conn.close()
@@ -302,6 +385,8 @@ async def run(handle, start, end, headless, noise_interval, slice_days, db_path=
         consec = 0
         retries = {}
         aborted = False
+        rl_streak = 0          # consecutive 429 windows (session heat)
+        pace_multiplier = 1.0  # adaptive inter-slice pacing after heat
         while queue:
             s, e = queue.popleft()
             if get_progress(conn, handle, s) in ("DONE", "SPLIT"):
@@ -315,6 +400,8 @@ async def run(handle, start, end, headless, noise_interval, slice_days, db_path=
             # progress uses durable new-row count. Log both.
             if status == "OK":
                 consec = 0
+                rl_streak = 0
+                pace_multiplier = max(1.0, pace_multiplier * 0.9)
                 if intercepted >= SPLIT_THRESHOLD:
                     log.info("Week %s = %d tweets -> daily sub-slices", s, intercepted)
                     for sub in reversed(subdivide(s, e)):
@@ -324,11 +411,38 @@ async def run(handle, start, end, headless, noise_interval, slice_days, db_path=
                     set_progress(conn, handle, s, e, "DONE")
                     log.info("Slice %s done: +%d new (%d intercepted)", s, added, intercepted)
             else:
+                # ---- CIRCUIT BREAKER: 429 = session HOT, not slice bad ----
+                if status == "RATE_LIMITED":
+                    rl_streak += 1
+                    wait = min(RL_MAX_COOLDOWN,
+                               RL_BASE_COOLDOWN * (2 ** (rl_streak - 1)))
+                    wait *= random.uniform(0.9, 1.3)
+                    pace_multiplier = min(4.0, pace_multiplier * 1.5)
+                    log.warning(
+                        "429 on %s (rl_streak=%d). Session HOT — FULL-QUEUE PAUSE "
+                        "%.0fs. Same slice retries first after cooldown.",
+                        s, rl_streak, wait)
+                    queue.appendleft((s, e))   # hold position; do NOT rotate
+                    await asyncio.sleep(wait)
+                    if rl_streak >= RL_MAX_STREAK:
+                        aborted = True
+                        log.error("RATE-LIMIT BREAKER: %d consecutive 429 windows. "
+                                  "Stopping resumable — resume in a few hours.",
+                                  rl_streak)
+                        break
+                    if not await probe_search(page, handle):
+                        aborted = True
+                        log.error("Probe still blocked after cooldown. "
+                                  "Stopping resumable — session needs hours.")
+                        break
+                    continue  # skip noise/break/inter-slice sleeps; we just cooled
+                # ---- non-429 failures: original semantics ----
                 consec += 1
                 retries[(s, e)] = retries.get((s, e), 0) + 1
-                if status == "RATE_LIMITED":
-                    wait = random.uniform(180, 300)
-                    log.warning("429 on %s. Cooling %.0fs, re-queuing.", s, wait)
+                if status == "SESSION_FLAGGED":
+                    wait = cooldown_delay(retries[(s, e)] + 1)
+                    log.error("401/403 on %s — session dying. Cooling %.0fs. "
+                              "Re-run 1_authenticator.py if this repeats.", s, wait)
                 else:
                     wait = random.uniform(45, 90)
                     log.warning("%s on %s. Re-queue, backoff %.0fs (try %d/%d)",
@@ -337,18 +451,20 @@ async def run(handle, start, end, headless, noise_interval, slice_days, db_path=
                 if retries[(s, e)] <= MAX_SLICE_RETRIES:
                     queue.append((s, e))
                 else:
-                    log.error("Slice %s failed %dx — left un-DONE for next run (resume-safe).", s, MAX_SLICE_RETRIES)
+                    log.error("Slice %s failed %dx — left un-DONE for next run "
+                              "(resume-safe).", s, MAX_SLICE_RETRIES)
                 if consec >= MAX_CONSEC_FAILS:
                     aborted = True
                     log.error("ABORT: %d consecutive failures. Progress saved.", consec)
                     break
             if done_count % noise_interval == 0:
                 await inject_noise(context)
+                await asyncio.sleep(max(5.0, human_delay(base=20, spread=1.0)))
             if done_count % 50 == 0:
-                wait = random.uniform(120, 300)
+                wait = max(60.0, human_delay(base=180, spread=1.2))
                 log.info("Long human break %.0fs", wait)
                 await asyncio.sleep(wait)
-            await asyncio.sleep(random.uniform(2.0, 5.0))
+            await asyncio.sleep(human_delay(base=3.5, spread=1.2) * pace_multiplier)
         await context.close()
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM tweets WHERE handle=?", (handle,))
@@ -365,7 +481,7 @@ def main():
     ap.add_argument("--end", required=True)
     ap.add_argument("--db", default=str(DB_PATH))
     ap.add_argument("--headless", action="store_true")
-    ap.add_argument("--noise-interval", type=int, default=15)
+    ap.add_argument("--noise-interval", type=int, default=8)
     ap.add_argument("--slice-days", type=int, default=7)
     a = ap.parse_args()
     asyncio.run(run(a.handle, a.start, a.end, a.headless, a.noise_interval, a.slice_days, Path(a.db)))

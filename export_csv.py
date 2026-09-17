@@ -30,6 +30,16 @@ def get_full_text(tweet_obj: Dict[str, Any]) -> str:
         text = note.get("text")
         if text:
             return normalize_text(text)
+        # Nested shapes: note_tweet_results.result.text / core.text
+        result = (note.get("note_tweet_results") or {}).get("result", {}) or {}
+        if isinstance(result, dict) and result.get("text"):
+            return normalize_text(result["text"])
+        core_text = (note.get("core") or {}).get("text") if isinstance(note.get("core"), dict) else None
+        if core_text:
+            return normalize_text(core_text)
+    ext = tweet_obj.get("extended_tweet")
+    if ext and isinstance(ext, dict) and ext.get("full_text"):
+        return normalize_text(ext["full_text"])
     legacy = tweet_obj.get("legacy", {})
     text = legacy.get("full_text", "")
     return normalize_text(text)

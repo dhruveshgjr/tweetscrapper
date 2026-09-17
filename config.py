@@ -6,6 +6,8 @@ Shared constants, paths, and helper functions for all scraper scripts.
 import os
 import json
 import logging
+import math
+import random
 from pathlib import Path
 
 USER_DATA_DIR = "./x_session"
@@ -14,6 +16,11 @@ DEFAULT_TARGET = "elonmusk"
 DEFAULT_MAX_TWEETS = 10000
 TWEETS_PER_REQUEST = 20
 REQUEST_DELAY_SECONDS = 1.0
+
+# Browser region — must match the authenticated account's expected region
+# so timezone/locale fingerprints stay consistent (anti-bot).
+BROWSER_TIMEZONE = "Africa/Nairobi"
+BROWSER_LOCALE = "en-KE"
 
 BEARER_TOKEN = (
     "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs"
@@ -167,3 +174,29 @@ def deduplicate(tweets: list, key=None) -> list:
             seen.add(k)
             unique.append(t)
     return unique
+
+
+# ------------------------------------------------------------- human delays
+# Human inter-action timing follows log-normal/gaussian distributions.
+# Uniform distributions are machine-detectable — use these instead.
+
+def human_delay(base: float = 2.5, spread: float = 1.2) -> float:
+    """Log-normal delay. Mimics human inter-action timing."""
+    return max(0.8, random.lognormvariate(math.log(base), spread * 0.3))
+
+
+def scroll_delay(round_num: int = 0) -> float:
+    """Scroll pacing that slows with depth, mimicking reading behavior."""
+    base = 2.0 + min(round_num * 0.05, 3.0)
+    return max(0.8, random.gauss(base, 0.6))
+
+
+def page_load_delay() -> float:
+    """After navigation, humans wait and scan."""
+    return max(1.5, random.gauss(4.5, 1.5))
+
+
+def cooldown_delay(attempt: int) -> float:
+    """Exponential backoff with jitter for rate limits."""
+    base = min(300, 30 * (2 ** max(0, attempt)))
+    return base * random.uniform(0.7, 1.3)

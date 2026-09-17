@@ -359,7 +359,7 @@ def export_to_csv(handle: str, db_path: Path = DEFAULT_DB,
         writer.writerow(HEADERS)
         for tid, created, clean, author, text, likes, rt, rep, quo, views, url in rows:
             writer.writerow(
-                [tid, created,
+                [f'="{tid}"', created,
                  format_client_date(clean),
                  author, text, likes, rt, rep, quo, views, url]
             )
